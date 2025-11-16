@@ -6,6 +6,18 @@
 #include "RPi_Pico_TimerInterrupt.h"
 #include "RPi_Pico_ISR_Timer.h"
 
+// Forward declarations
+void write_dac_sample(uint16_t sample);
+uint16_t read_ram_sample(uint32_t global_address);
+void write_ram_sample_sequential(uint16_t sample);
+void deselect_all_chips();
+void set_ram_byte_mode();
+void drawOptionList();
+void drawSampleList();
+void updateSequencerScreen();
+void updateSongScreen();
+void updateRecordingScreen();
+
 #define R1 7
 #define R2 8
 #define R3 9
@@ -19,7 +31,7 @@
 #define TIMER_FREQ_HZ 16000  // 22050 // 11025
 #define SYNC_PULSE_DURATION 60  // ~5 ms at 12,000 Hz
 
-#define STEPS_PER_MEASURE 32
+#define STEPS_PER_MEASURE 16
 #define MAX_LAYERED_SAMPLES 3  // Can expand later
 
 #define SAMPLE_RATE 16000  // 11025 // 22050
@@ -46,20 +58,22 @@ typedef struct {
   bool triggered;
 } SequencerStep;
 
-SequencerStep sequencer_map[STEPS_PER_MEASURE];
+SequencerStep sequencer_map[2][STEPS_PER_MEASURE];
 
 typedef struct {
   SequencerStep steps[STEPS_PER_MEASURE];
 } Sequence;
 
 #define MAX_SEQUENCES 16
-Sequence sequence_bank[MAX_SEQUENCES];
+Sequence sequence_bank[2][MAX_SEQUENCES];
 int sequenceCount = 0;
 
 void save_sequence() {
   if (sequenceCount < MAX_SEQUENCES) {
-    for (int i = 0; i < STEPS_PER_MEASURE; i++) {
-      sequence_bank[sequenceCount].steps[i] = sequencer_map[i];
+    for (int i = 0; i < 2; i++) {
+      for (int j = 0; j < STEPS_PER_MEASURE; j++) {
+        sequence_bank[i][sequenceCount].steps[j] = sequencer_map[i][j];
+      }
     }
 
     sequenceCount++;
@@ -69,8 +83,10 @@ void save_sequence() {
 void load_sequence(int slot) {
   if (slot < 0 || slot >= MAX_SEQUENCES) return;
 
-  for (int i = 0; i < STEPS_PER_MEASURE; i++) {
-    sequencer_map[i] = sequence_bank[slot].steps[i];
+  for (int i = 0; i < 2; i++) {
+    for (int j = 0; j < STEPS_PER_MEASURE; j++) {
+      sequencer_map[i][j] = sequence_bank[i][slot].steps[j];
+    }
   }
 }
 
@@ -355,11 +371,11 @@ bool TimerHandler(struct repeating_timer *t) {
           load_sequence(sequence_chain[current_chain_index]);
 
           // recalc the samples_per_step MAYBE
-          if (sequencer_map[0].triggered && samples[sequencer_map[0].sample_id].changes_tempo) {
-            int sampleLength = samples[sequencer_map[0].sample_id].end - samples[sequencer_map[0].sample_id].start;
-            float pitchModifier = (float)64 / samples[sequencer_map[0].sample_id].pitch;
+          if (sequencer_map[0][0].triggered && samples[sequencer_map[0][0].sample_id].changes_tempo) {
+            int sampleLength = samples[sequencer_map[0][0].sample_id].end - samples[sequencer_map[0][0].sample_id].start;
+            float pitchModifier = (float)64 / samples[sequencer_map[0][0].sample_id].pitch;
             float pitchModifiedSampleLength = sampleLength * pitchModifier;
-            samples_per_step = (int)(pitchModifiedSampleLength / 64); // WHAT??
+            samples_per_step = (int)(pitchModifiedSampleLength / 32); // WHAT??
           }
           
           current_chain_index = (current_chain_index + 1) % MAX_SEQUENCE_CHAIN;
@@ -371,18 +387,18 @@ bool TimerHandler(struct repeating_timer *t) {
       }
 
       if (swing && sync_pulse_counter == 0) {
-        //if (current_step % 8 || current_step == 6 || current_step == 14 || current_step == 22 || current_step == 30 ) {
-        if (current_step % 8 == 0 || current_step == 5 || current_step == 13 || current_step == 21 || current_step == 29 ) {
+        // Swing pattern for 16 steps (adjusted from 32)
+        if (current_step % 4 == 0 || current_step == 2 || current_step == 6 || current_step == 10 || current_step == 14 ) {
           digitalWrite(SYNC_PIN, HIGH);
           sync_pulse_counter = SYNC_PULSE_DURATION;
         }
-      } else if (((doubleTime && current_step % 2 == 0) || current_step % 4 == 0) && sync_pulse_counter == 0) {
+      } else if (((doubleTime && current_step % 1 == 0) || current_step % 2 == 0) && sync_pulse_counter == 0) {
         digitalWrite(SYNC_PIN, HIGH);
         sync_pulse_counter = SYNC_PULSE_DURATION;
       }
 
 
-      if (current_step % 8 == 0) {
+      if (current_step % 4 == 0) {  // Every 4 steps = quarter note (was 8 for 32 steps)
         if (currentState == SAMPLER_PLAYBACK_STATE) {
           cursorPos = current_step;  // Show playback position only on quarter notes
         } else {
@@ -393,47 +409,54 @@ bool TimerHandler(struct repeating_timer *t) {
 
         digitalWrite(LED_PIN, HIGH);
         needsUpdate = true;
-      } else if (current_step % 4 == 0) {
+      } else if (current_step % 2 == 0) {  // Every 2 steps = eighth note (was 4 for 32 steps)
         digitalWrite(LED_PIN, LOW);
       }
 
       // Trigger step
 
-      // alternate step hypothesis
-      // start with current_step == 0
-      SequencerStep *step = &sequencer_map[current_step];
-      if (step->triggered) {
-        for (int i = 0; i < MAX_LAYERED_SAMPLES; i++) {
-          if (active_samples[i].active && active_samples[i].sample_id == step->sample_id) {
+      // Trigger step - optimized to handle both primary and secondary in one pass
+      SequencerStep *primaryStep = &sequencer_map[0][current_step];
+      SequencerStep *secondaryStep = &sequencer_map[1][current_step];
+      bool needPrimarySlot = primaryStep->triggered;
+      bool needSecondarySlot = secondaryStep->triggered;
+      int8_t primarySlot = -1;
+      int8_t secondarySlot = -1;
+      
+      // Single pass to find slots and reset existing samples
+      for (int i = 0; i < MAX_LAYERED_SAMPLES; i++) {
+        if (active_samples[i].active) {
+          // Check if this is a retriggered sample
+          if (needPrimarySlot && active_samples[i].sample_id == primaryStep->sample_id) {
             active_samples[i].accumulator = 0;
-            break;
-          } else if (!active_samples[i].active && free_slot == -1) {
-            free_slot = i;
+            needPrimarySlot = false;
+            continue;
           }
-        }
-
-        if (free_slot != -1) {
-          active_samples[free_slot].sample_id = step->sample_id;
-          active_samples[free_slot].accumulator = 0;
-          active_samples[free_slot].active = true;
+          if (needSecondarySlot && active_samples[i].sample_id == secondaryStep->sample_id) {
+            active_samples[i].accumulator = 0;
+            needSecondarySlot = false;
+            continue;
+          }
+        } else {
+          // Found free slot
+          if (needPrimarySlot && primarySlot == -1) {
+            primarySlot = i;
+          } else if (needSecondarySlot && secondarySlot == -1) {
+            secondarySlot = i;
+          }
         }
       }
-
-      // okay but...what if we want to recalc here so the secondary beat plays under everything?
-      // otherwise it has to be "per sequence" anyway
-      if (current_step == 0 && secondary_zero_beat_sample_id != -1) {
-        // we want a second sample playing at 0 time
-        // find the free spot
-        int slot = -1;
-        for (int i = 0; i < MAX_LAYERED_SAMPLES; i++) {
-          if (!active_samples[i].active) {
-            active_samples[i].sample_id = secondary_zero_beat_sample_id;
-            active_samples[i].accumulator = 0;
-            active_samples[i].active = true;
-
-            break;
-          }
-        }
+      
+      // Activate new samples
+      if (needPrimarySlot && primarySlot != -1) {
+        active_samples[primarySlot].sample_id = primaryStep->sample_id;
+        active_samples[primarySlot].accumulator = 0;
+        active_samples[primarySlot].active = true;
+      }
+      if (needSecondarySlot && secondarySlot != -1) {
+        active_samples[secondarySlot].sample_id = secondaryStep->sample_id;
+        active_samples[secondarySlot].accumulator = 0;
+        active_samples[secondarySlot].active = true;
       }
 
       current_step = (current_step + 1) % STEPS_PER_MEASURE;
@@ -459,13 +482,8 @@ bool TimerHandler(struct repeating_timer *t) {
         if (address < s->end) {
           mixed_sample += read_ram_sample(address) - 2048;  // signed 16-bit
 
-          float pitch;
-          if (s->matched_pitch != 0) {
-            pitch = s->matched_pitch;
-          } else {
-            pitch = s->pitch;
-          }
-
+          // Use matched_pitch if available, otherwise use pitch (avoid branch with ternary on uint8_t)
+          uint8_t pitch = s->matched_pitch ? s->matched_pitch : s->pitch;
           active_samples[i].accumulator += pitch;
         } else {
           active_samples[i].active = false;
@@ -612,43 +630,40 @@ void set_ram_sequential_mode() {
 }
 
 uint16_t read_ram_sample(uint32_t global_address) {
-  uint8_t chip = (global_address) / CHUNK_SIZE;
-  uint32_t local_address = (global_address) % CHUNK_SIZE;
-
-  // select_chip(chip);
-  // SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE3));
-  // SPI.transfer(3);
-  // SPI.transfer((local_address >> 16) & 0xFF);
-  // SPI.transfer((local_address >> 8) & 0xFF);
-  // SPI.transfer(local_address & 0xFF);
-  // uint8_t upper = SPI.transfer(0);
-  // SPI.endTransaction();
-
-  // global_address++;
-  // chip = global_address / CHUNK_SIZE;
-  // local_address = global_address % CHUNK_SIZE;
+  uint8_t chip = global_address / CHUNK_SIZE;
+  uint32_t local_address = global_address % CHUNK_SIZE;
 
   select_chip(chip);
   SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE3));
-  SPI.transfer(3);
+  SPI.transfer(3);  // Read command
   SPI.transfer((local_address >> 16) & 0xFF);
   SPI.transfer((local_address >> 8) & 0xFF);
   SPI.transfer(local_address & 0xFF);
+  
+  // Read both bytes in the same transaction
   uint8_t upper = SPI.transfer(0);
-  // SPI.endTransaction();
-  // deselect_all_chips();
-  global_address++;
-
-  chip = (global_address) / CHUNK_SIZE;
-  local_address = (global_address) % CHUNK_SIZE;
-
-  select_chip(chip);
-  SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE3));
-  SPI.transfer(3);
-  SPI.transfer((local_address >> 16) & 0xFF);
-  SPI.transfer((local_address >> 8) & 0xFF);
-  SPI.transfer(local_address & 0xFF);
-  uint8_t lower = SPI.transfer(0);
+  
+  // Check if we cross chip boundary
+  uint8_t lower;
+  if (((global_address + 1) / CHUNK_SIZE) != chip) {
+    // Crossed chip boundary - need to switch chips
+    SPI.endTransaction();
+    deselect_all_chips();
+    
+    chip = (global_address + 1) / CHUNK_SIZE;
+    local_address = (global_address + 1) % CHUNK_SIZE;
+    
+    select_chip(chip);
+    SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE3));
+    SPI.transfer(3);
+    SPI.transfer((local_address >> 16) & 0xFF);
+    SPI.transfer((local_address >> 8) & 0xFF);
+    SPI.transfer(local_address & 0xFF);
+    lower = SPI.transfer(0);
+  } else {
+    // Same chip - just read next byte
+    lower = SPI.transfer(0);
+  }
 
   SPI.endTransaction();
   deselect_all_chips();
@@ -809,7 +824,7 @@ void updateSongScreen() {
   lcd.clear();
   lcd.setCursor(0, 0);
 
-  for (uint8_t i = 0; i < 32; i++) {
+  for (uint8_t i = 0; i < 16; i++) {
     if (songCursorPos == i) {
       if (currentState == SONG_PLAYBACK_STATE) {
         lcd.write("*");
@@ -823,9 +838,23 @@ void updateSongScreen() {
         lcd.write('A' + sequence_chain[i]);
       }
     }
-
-    if (i == 15) {
-      lcd.setCursor(0, 1);
+  }
+  
+  // Second row - next 16 positions
+  lcd.setCursor(0, 1);
+  for (uint8_t i = 16; i < 32; i++) {
+    if (songCursorPos == i) {
+      if (currentState == SONG_PLAYBACK_STATE) {
+        lcd.write("*");
+      } else {
+        lcd.write(255);
+      }
+    } else {
+      if (sequence_chain[i] == -1) {
+        lcd.write("-");
+      } else {
+        lcd.write('A' + sequence_chain[i]);
+      }
     }
   }
 }
@@ -835,9 +864,10 @@ void updateSequencerScreen() {
   lastLcdUpdate = millis();
 
   lcd.clear();
+  
+  // Top row - PRIMARY samples (sequencer_map[0])
   lcd.setCursor(0, 0);
-
-  for (uint8_t i = 0; i < 32; i++) {
+  for (uint8_t i = 0; i < 16; i++) {
     if (cursorPos == i) {
       if (currentState == SAMPLER_PLAYBACK_STATE) {
         lcd.write("*");
@@ -845,15 +875,30 @@ void updateSequencerScreen() {
         lcd.write(255);
       }
     } else {
-      if (sequencer_map[i].triggered) {
-        lcd.write('A' + sequencer_map[i].sample_id);
+      if (sequencer_map[0][i].triggered) {
+        lcd.write('A' + sequencer_map[0][i].sample_id);
       } else {
         lcd.write("-");
       }
     }
-
-    if (i == 15) {
-      lcd.setCursor(0, 1);
+  }
+  
+  // Bottom row - SECONDARY samples (sequencer_map[1])
+  lcd.setCursor(0, 1);
+  for (uint8_t i = 0; i < 16; i++) {
+    if (cursorPos == i) {
+      // Show cursor on bottom row too if on that position
+      if (currentState == SAMPLER_PLAYBACK_STATE) {
+        lcd.write("*");
+      } else {
+        lcd.write(255);
+      }
+    } else {
+      if (sequencer_map[1][i].triggered) {
+        lcd.write('A' + sequencer_map[1][i].sample_id);
+      } else {
+        lcd.write(" ");
+      }
     }
   }
 }
@@ -1307,6 +1352,7 @@ void enterEditStateForSample() {
 bool flipper = false;
 long last_millis = 0;
 bool modeButtonUsedAsModifier = false;
+bool selectingSecondarySample = false;
 bool displayingMessage = false;
 int messageTime = 0;
 void (*nextFunc)();
@@ -1363,74 +1409,72 @@ void loop() {
       }
       break;
     
-    case SELECT_MATCH_STATE:
-      {
-        if (upButton.pressed()) {
-          if (selectedMatchSample > 0) selectedMatchSample--;
+    // case SELECT_MATCH_STATE:
+    //   {
+    //     if (upButton.pressed()) {
+    //       if (selectedMatchSample > 0) selectedMatchSample--;
 
-          Serial.println(selectedMatchSample);
-          Serial.println(sampleCount);
-          Serial.println("");
+    //       Serial.println(selectedMatchSample);
+    //       Serial.println(sampleCount);
+    //       Serial.println("");
 
-          drawSelectMatchList();
-        }
+    //       drawSelectMatchList();
+    //     }
 
-        if (downButton.pressed()) {
-          if (selectedMatchSample < sampleCount) selectedMatchSample++;
+    //     if (downButton.pressed()) {
+    //       if (selectedMatchSample < sampleCount) selectedMatchSample++;
 
-          Serial.println(selectedMatchSample);
-          Serial.println(sampleCount);
-          Serial.println("");
+    //       Serial.println(selectedMatchSample);
+    //       Serial.println(sampleCount);
+    //       Serial.println("");
 
-          drawSelectMatchList();
-        }
+    //       drawSelectMatchList();
+    //     }
 
-        if (selectButton.pressed()) {
-          if (selectedMatchSample > 1) {
-            Serial.println(selectedMatchSample);
+    //     if (selectButton.pressed()) {
+    //       if (selectedMatchSample > 1) {
+    //         Serial.println(selectedMatchSample);
 
-            uint8_t matchSample = selectedMatchSample - 1;
+    //         uint8_t matchSample = selectedMatchSample - 1;
+    //         uint32_t yourLen = samples[matchSample].end - samples[matchSample].start;
+    //         uint32_t myLen = samples[selectedSample].end - samples[selectedSample].start;
 
-            // let's pretend it's selectedMatchSample - 1
-            uint32_t yourLen = samples[matchSample].end - samples[matchSample].start;
-            uint32_t myLen = samples[selectedSample].end - samples[selectedSample].start;
+    //         // yes I'm really a programmer
+    //         float pitchModifier = (float)64 / samples[matchSample].pitch;
+    //         float pitchModifiedSampleLength = yourLen * pitchModifier;
 
-            // yes I'm really a programmer
-            float pitchModifier = (float)64 / samples[matchSample].pitch;
-            float pitchModifiedSampleLength = yourLen * pitchModifier;
+    //         samples[selectedSample].matched_sample_id = matchSample;
+    //         float floatLen = (float)myLen / pitchModifiedSampleLength;
+    //         samples[selectedSample].matched_pitch = floatLen * 64;
 
-            samples[selectedSample].matched_sample_id = matchSample;
-            float floatLen = (float)myLen / pitchModifiedSampleLength;
-            samples[selectedSample].matched_pitch = floatLen * 64;
+    //         secondary_zero_beat_sample_id = selectedSample;
 
-            secondary_zero_beat_sample_id = selectedSample;
+    //         Serial.println("selectedSample");
+    //         Serial.println(selectedSample);
+    //         Serial.println("matchSample");
+    //         Serial.println(matchSample);
+    //         Serial.println("selectedSample Len");
+    //         Serial.println(myLen);
+    //         Serial.println("matchSample Len");
+    //         Serial.println(yourLen);
+    //         Serial.println("matched_sample_id");
+    //         Serial.println(samples[selectedSample].matched_sample_id);
+    //         Serial.println("matched_pitch");
+    //         Serial.println(samples[selectedSample].matched_pitch);
+    //         Serial.println("secondary_zero_beat_sample_id");
+    //         Serial.println(secondary_zero_beat_sample_id);
 
-            Serial.println("selectedSample");
-            Serial.println(selectedSample);
-            Serial.println("matchSample");
-            Serial.println(matchSample);
-            Serial.println("selectedSample Len");
-            Serial.println(myLen);
-            Serial.println("matchSample Len");
-            Serial.println(yourLen);
-            Serial.println("matched_sample_id");
-            Serial.println(samples[selectedSample].matched_sample_id);
-            Serial.println("matched_pitch");
-            Serial.println(samples[selectedSample].matched_pitch);
-            Serial.println("secondary_zero_beat_sample_id");
-            Serial.println(secondary_zero_beat_sample_id);
+    //         currentState = INDEX_STATE;
+    //         drawSampleList();
+    //       }
+    //     }
 
-            currentState = INDEX_STATE;
-            drawSampleList();
-          }
-        }
-
-        if (modeButton.pressed()) {
-          currentState = INDEX_STATE;
-          drawSampleList();
-        }
-      }
-      break;
+    //     if (modeButton.pressed()) {
+    //       currentState = INDEX_STATE;
+    //       drawSampleList();
+    //     }
+    //   }
+    //   break;
 
     case INDEX_STATE:
       {
@@ -1581,14 +1625,22 @@ void loop() {
 
         if (upButton.pressed()) {
           cursorPos--;
-          if (cursorPos == 255) cursorPos = 31;
+          if (cursorPos == 255) cursorPos = 15;
           updateSequencerScreen();
         }
 
         if (downButton.pressed()) {
-          cursorPos++;
-          if (cursorPos == 32) cursorPos = 0;
-          updateSequencerScreen();
+          if (modeButton.held()) {
+            modeButtonUsedAsModifier = true;
+            selectingSecondarySample = true;
+
+            currentState = SELECT_SAMPLE_STATE;
+            drawSelectSampleList();
+          } else {
+            cursorPos++;
+            if (cursorPos == 16) cursorPos = 0;
+            updateSequencerScreen();
+          }
         }
 
         if (recordButton.pressed()) {
@@ -1603,6 +1655,7 @@ void loop() {
             lcd.setCursor(0, 0);
             lcd.println("SEQUENCE SAVED!");
           } else {
+            selectingSecondarySample = false;
             currentState = SELECT_SAMPLE_STATE;
             drawSelectSampleList();
           }
@@ -1610,6 +1663,7 @@ void loop() {
 
         if (modeButton.released()) {
           if (!modeButtonUsedAsModifier) {
+            selectingSecondarySample = false;
             currentState = HOME_STATE;
             drawOptionList();
           }
@@ -1661,6 +1715,7 @@ void loop() {
 
         // go back to sequencer with no changes
         if (modeButton.pressed()) {
+          selectingSecondarySample = false;
           sequencer_tick_counter = samples_per_step;
           current_step = 0;
           currentState = SAMPLER_STATE;
@@ -1671,17 +1726,22 @@ void loop() {
         if (recordButton.pressed()) {
           // select the sample
           // so modify the sequence_map here then go back
-          if (sequencerSelectedSample == 0) {
-            sequencer_map[cursorPos].triggered = false;
+          // if NONE is selected, turn off triggering for this step
+          // also need to keep track of secondary sample
+          uint8_t primaryOrSecondarySample = selectingSecondarySample ? 1 : 0;
 
-            if (cursorPos == 0) {
+          if (sequencerSelectedSample == 0) {
+            sequencer_map[primaryOrSecondarySample][cursorPos].triggered = false;
+
+            // only reset tempo if primary sample is being modified
+            if (cursorPos == 0 && !selectingSecondarySample) {
               samples_per_step = 1000;
             }
           } else {
-            sequencer_map[cursorPos].sample_id = sequencerSelectedSample - 1;
-            sequencer_map[cursorPos].triggered = true;
+            sequencer_map[primaryOrSecondarySample][cursorPos].sample_id = sequencerSelectedSample - 1;
+            sequencer_map[primaryOrSecondarySample][cursorPos].triggered = true;
             
-            if (cursorPos == 0) {
+            if (cursorPos == 0 && !selectingSecondarySample) {
               if (samples[sequencerSelectedSample - 1].changes_tempo) {
                 // length of this sample (end - start) / 32 steps per measure
                 // everything operates at 16000 samples per second so record/playback/sequence all "work" together
@@ -1692,7 +1752,7 @@ void loop() {
                 int sampleLength = samples[sequencerSelectedSample - 1].end - samples[sequencerSelectedSample - 1].start;
                 float pitchModifier = (float)64 / samples[sequencerSelectedSample - 1].pitch;
                 float pitchModifiedSampleLength = sampleLength * pitchModifier;
-                samples_per_step = (int)(pitchModifiedSampleLength / 64); // WHAT??
+                samples_per_step = (int)(pitchModifiedSampleLength / 32); // WHAT??
               } else {
                 // this sample doesn't change the tempo, so we should really fall back to a global tempo setting.
                 // right now that's just hardcoded at 120 bpm
@@ -1763,13 +1823,13 @@ void loop() {
 
         if (upButton.pressed()) {
           songCursorPos--;
-          if (songCursorPos == 255) songCursorPos = 31;
+          if (songCursorPos == 255) songCursorPos = 31;  // Keep 32 for song chains
           updateSongScreen();
         }
 
         if (downButton.pressed()) {
           songCursorPos++;
-          if (songCursorPos == 32) songCursorPos = 0;
+          if (songCursorPos == 32) songCursorPos = 0;  // Keep 32 for song chains
           updateSongScreen();
         }
 
@@ -1794,14 +1854,14 @@ void loop() {
           int sequence_id = sequence_chain[0];
           if (sequence_id != -1) {
             // when you stop playing the chain, restart from the beginning
-            Sequence *seq = &sequence_bank[sequence_id];
+            Sequence *seq = &sequence_bank[0][sequence_id];
             uint8_t id = seq->steps[0].sample_id;
 
             if (samples[id].changes_tempo) {
               int sampleLength = samples[id].end - samples[id].start;
               float pitchModifier = (float)64 / samples[id].pitch;
               float pitchModifiedSampleLength = sampleLength * pitchModifier;
-              samples_per_step = (int)(pitchModifiedSampleLength / 64); // WHAT??
+              samples_per_step = (int)(pitchModifiedSampleLength / 32); // WHAT??
             } else {
               // this sample doesn't change the tempo, so we should really fall back to a global tempo setting.
               // right now that's just hardcoded at 120 bpm
@@ -1905,14 +1965,14 @@ void loop() {
             sequence_chain[songCursorPos] = songSelectedSequence - 1; // have to subtract 1 because of the None option
 
             if (songCursorPos == 0) {
-              Sequence *seq = &sequence_bank[songSelectedSequence - 1];
+              Sequence *seq = &sequence_bank[0][songSelectedSequence - 1];
               uint8_t id = seq->steps[0].sample_id;
 
               if (samples[id].changes_tempo) {
                 int sampleLength = samples[id].end - samples[id].start;
                 float pitchModifier = (float)64 / samples[id].pitch;
                 float pitchModifiedSampleLength = sampleLength * pitchModifier;
-                samples_per_step = (int)(pitchModifiedSampleLength / 64); // WHAT??
+                samples_per_step = (int)(pitchModifiedSampleLength / 32); // WHAT??
               } else {
                 // since this sample doesn't change the tempo we should really fall back to a global bpm
                 // for now it's hardcoded to 120 bpm

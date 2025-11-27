@@ -5,6 +5,7 @@
 #include <Adafruit_SSD1306.h>
 #include "RPi_Pico_TimerInterrupt.h"
 #include "RPi_Pico_ISR_Timer.h"
+#include "hardware/gpio.h"  // For fast GPIO access
 
 // Forward declarations
 void write_dac_sample(uint16_t sample);
@@ -25,6 +26,7 @@ void updateRecordingScreen();
 
 #define LED_PIN 22
 #define SYNC_PIN 17
+#define DAC_CS_PIN 13
 
 #define MAX_SAMPLES 10
 
@@ -169,9 +171,6 @@ bool sampleLengthLocked = false;
 int8_t lockedSampleIndex = -1;
 int8_t sampleLengthDivision = 0; //0 == 1/1, 1 == 1/2, 2 == 1/4
 
-const unsigned long lcdUpdateInterval = 36;  // ms between LCD refreshes
-unsigned long lastLcdUpdate = 0;
-
 // const float alpha = 0.2f;  // LPF factor
 // float lpfStart = 0;
 // float lpfEnd = 0;
@@ -300,7 +299,14 @@ uint8_t last_step = 255;
 uint8_t cursorPos = 0;
 uint8_t edit_cursor_pos = 0;
 uint8_t songCursorPos = 0;
-int secondary_zero_beat_sample_id = -1;
+
+inline void fastDigitalWriteHigh(uint8_t pin) {
+  gpio_set_mask(1ul << pin);
+}
+
+inline void fastDigitalWriteLow(uint8_t pin) {
+  gpio_clr_mask(1ul << pin);
+}
 
 bool TimerHandler(struct repeating_timer *t) {
   if (currentState == RECORD_STATE) {
@@ -316,10 +322,10 @@ bool TimerHandler(struct repeating_timer *t) {
     } else if (sample < 500 || sample > 3500) {
       clipping = true;
       clipping_counter = 500;
-      digitalWrite(LED_PIN, HIGH);
+      fastDigitalWriteHigh(LED_PIN);
     } else if (clipping) {
       clipping = false;
-      digitalWrite(LED_PIN, LOW);
+      fastDigitalWriteLow(LED_PIN);
     }
 
     // write_dac_sample(sample);
@@ -389,14 +395,13 @@ bool TimerHandler(struct repeating_timer *t) {
       if (swing && sync_pulse_counter == 0) {
         // Swing pattern for 16 steps (adjusted from 32)
         if (current_step % 4 == 0 || current_step == 2 || current_step == 6 || current_step == 10 || current_step == 14 ) {
-          digitalWrite(SYNC_PIN, HIGH);
+          fastDigitalWriteHigh(SYNC_PIN);
           sync_pulse_counter = SYNC_PULSE_DURATION;
         }
       } else if (((doubleTime && current_step % 1 == 0) || current_step % 2 == 0) && sync_pulse_counter == 0) {
-        digitalWrite(SYNC_PIN, HIGH);
+        fastDigitalWriteHigh(SYNC_PIN);
         sync_pulse_counter = SYNC_PULSE_DURATION;
       }
-
 
       if (current_step % 4 == 0) {  // Every 4 steps = quarter note (was 8 for 32 steps)
         if (currentState == SAMPLER_PLAYBACK_STATE) {
@@ -407,13 +412,11 @@ bool TimerHandler(struct repeating_timer *t) {
           }
         }
 
-        digitalWrite(LED_PIN, HIGH);
+        fastDigitalWriteHigh(LED_PIN);
         needsUpdate = true;
       } else if (current_step % 2 == 0) {  // Every 2 steps = eighth note (was 4 for 32 steps)
-        digitalWrite(LED_PIN, LOW);
+        fastDigitalWriteLow(LED_PIN);
       }
-
-      // Trigger step
 
       // Trigger step - optimized to handle both primary and secondary in one pass
       SequencerStep *primaryStep = &sequencer_map[0][current_step];
@@ -466,7 +469,7 @@ bool TimerHandler(struct repeating_timer *t) {
       sync_pulse_counter--;
 
       if (sync_pulse_counter == 0) {
-        digitalWrite(SYNC_PIN, LOW);
+        fastDigitalWriteLow(SYNC_PIN);
       }
     }
 
@@ -506,7 +509,7 @@ bool TimerHandler(struct repeating_timer *t) {
     }
 
     write_dac_sample(dac_value);
-  } else {
+  } else if (currentState != EDIT_STATE) {
     uint16_t sample = analogRead(A2);
 
     if (clipping_counter > 0) {
@@ -514,10 +517,10 @@ bool TimerHandler(struct repeating_timer *t) {
     } else if (sample < 500 || sample > 3500) {
       clipping = true;
       clipping_counter = 500;
-      digitalWrite(LED_PIN, HIGH);
+      fastDigitalWriteHigh(LED_PIN);
     } else if (clipping) {
       clipping = false;
-      digitalWrite(LED_PIN, LOW);
+      fastDigitalWriteLow(LED_PIN);
     }
     
     write_dac_sample(sample);
@@ -541,19 +544,6 @@ void setup() {
 
   init_tanh_table();
 
-  // sequencer_map[0].sample_id = 1;
-  // sequencer_map[0].triggered = true;
-  // sequencer_map[8].sample_id = 2;
-  // sequencer_map[8].triggered = true;
-  // sequencer_map[16].sample_id = 1;
-  // sequencer_map[16].triggered = true;
-  // sequencer_map[24].sample_id = 2;
-  // sequencer_map[24].triggered = true;
-
-  // pinMode(CLK_PIN, INPUT_PULLUP);
-  // pinMode(DT_PIN, INPUT_PULLUP);
-  // attachInterrupt(digitalPinToInterrupt(CLK_PIN), updateEncoder, CHANGE);
-
   //button.begin();
   recordButton.begin();
   selectButton.begin();
@@ -573,11 +563,11 @@ void setup() {
 
   for (uint8_t i = 0; i < 4; ++i) {
     pinMode(chip_select_pins[i], OUTPUT);
-    digitalWrite(chip_select_pins[i], HIGH);
+    fastDigitalWriteHigh(chip_select_pins[i]);
   }
 
-  pinMode(13, OUTPUT);
-  digitalWrite(13, HIGH);
+  pinMode(DAC_CS_PIN, OUTPUT);
+  fastDigitalWriteHigh(DAC_CS_PIN);
 
   ITimer.attachInterrupt(TIMER_FREQ_HZ, TimerHandler);
 
@@ -593,22 +583,31 @@ void setup() {
 }
 
 void write_dac_sample(uint16_t sample) {
-  digitalWrite(13, LOW);
+  fastDigitalWriteLow(DAC_CS_PIN);
   SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE3));
   SPI.transfer16(0b0101000000000000 | sample);
   SPI.endTransaction();
-  digitalWrite(13, HIGH);
+  fastDigitalWriteHigh(DAC_CS_PIN);
 }
 
+// Track current chip to avoid unnecessary deselects
+uint8_t current_selected_chip = 255;
+
 void select_chip(uint8_t chip) {
+  if (current_selected_chip == chip) return;  // Already selected
+  
+  // Deselect all and select target
   for (uint8_t i = 0; i < 4; ++i)
-    digitalWrite(chip_select_pins[i], HIGH);
-  digitalWrite(chip_select_pins[chip], LOW);
+    fastDigitalWriteHigh(chip_select_pins[i]);
+  fastDigitalWriteLow(chip_select_pins[chip]);
+  
+  current_selected_chip = chip;
 }
 
 void deselect_all_chips() {
   for (uint8_t i = 0; i < 4; ++i)
-    digitalWrite(chip_select_pins[i], HIGH);
+    fastDigitalWriteHigh(chip_select_pins[i]);
+  current_selected_chip = 255;
 }
 
 void set_ram_mode(uint8_t mode) {
@@ -718,7 +717,9 @@ void write_ram_sample_sequential(uint16_t sample) {
   uint8_t chip = global_position / CHUNK_SIZE;
 
   SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE3));
-  SPI.transfer16(sample);
+  // Write as two separate bytes to match how we read
+  SPI.transfer((sample >> 8) & 0xFF);  // Upper byte
+  SPI.transfer(sample & 0xFF);         // Lower byte
   SPI.endTransaction();
 
   // write_dac_sample(sample);
@@ -750,7 +751,11 @@ void stopRecording() {
   currentState = INDEX_STATE;
   end_writing_ram_sequential();
 
-  digitalWrite(LED_PIN, LOW);
+  fastDigitalWriteLow(LED_PIN);
+
+  if (global_position % 2 != 0) {
+    global_position--;  // Ensure even byte alignment
+  }
 
   if (sampleCount < MAX_SAMPLES) {
     Sample *s = &samples[sampleCount];
@@ -758,12 +763,24 @@ void stopRecording() {
     s->start = starting_record_position;
     s->end = global_position;
 
+    if (s->start % 2 != 0) {
+      s->start--;  // Ensure even byte alignment
+    }
+
+    if (s->end % 2 != 0) {
+      s->end--;  // Ensure even byte alignment
+    }
+
     Serial.print("starting_record_position: ");
     Serial.println(starting_record_position);
     Serial.print("global_position: ");
     Serial.println(global_position);
     Serial.print("len: ");
     Serial.println(global_position - starting_record_position);
+    Serial.print("start: ");
+    Serial.println(s->start);
+    Serial.print("end: ");
+    Serial.println(s->end);
 
     sampleCount++;
   }
@@ -818,9 +835,6 @@ void enterSelectedOption() {
 }
 
 void updateSongScreen() {
-  if (millis() - lastLcdUpdate < lcdUpdateInterval) return;
-  lastLcdUpdate = millis();
-
   lcd.clear();
   lcd.setCursor(0, 0);
 
@@ -860,9 +874,6 @@ void updateSongScreen() {
 }
 
 void updateSequencerScreen() {
-  if (millis() - lastLcdUpdate < lcdUpdateInterval) return;
-  lastLcdUpdate = millis();
-
   lcd.clear();
   
   // Top row - PRIMARY samples (sequencer_map[0])
@@ -1184,14 +1195,10 @@ uint16_t lastPot1 = 0;
 uint16_t lastPot2 = 0;
 
 void updateEditScreen() {
-  // Skip LCD refresh if interval hasn’t passed
-  if (millis() - lastLcdUpdate < lcdUpdateInterval) return;
-  lastLcdUpdate = millis();
-
   uint16_t start = analogRead(A0);
   uint16_t end = analogRead(A1);
 
-  if (abs(lastPot1 - start) < 10 && abs(lastPot2 - end) < 10) {
+  if (abs(lastPot1 - start) < 100 && abs(lastPot2 - end) < 100) {
     return;
   }
 
@@ -1218,10 +1225,10 @@ void updateEditScreen() {
     // if that doesn't fit, defualt to 1/4
     // don't switch to ones that don't fit
     // if none fit then...
-    if (lockedSampleLength > totalSamplesInView) {
-      // make some auto adjustments to account for lack of room to fit sample
-      // OR DIE
-    }
+    // if (lockedSampleLength > totalSamplesInView) {
+    //   // make some auto adjustments to account for lack of room to fit sample
+    //   // OR DIE
+    // }
       // do the code to do the thing vvv
       
       // if (mappedStart + (lockedSampleLength / 2) < totalSamplesInView) {
@@ -1250,18 +1257,18 @@ void updateEditScreen() {
     playback_pitch = map(end, 0, 4095, 32, 127);
   }
 
-  Serial.print("totalSamplesInView (the sample length): ");
-  Serial.println(totalSamplesInView);
-  Serial.print("locked? ");
-  Serial.println(sampleLengthLocked);
-  Serial.print("mappedStart: ");
-  Serial.println(mappedStart);
-  Serial.print("mappedEnd: ");
-  Serial.println(mappedEnd);
-  Serial.print("sliceStart: ");
-  Serial.println(sliceStart);
-  Serial.print("sliceEnd: ");
-  Serial.println(sliceEnd);
+  // Serial.print("totalSamplesInView (the sample length): ");
+  // Serial.println(totalSamplesInView);
+  // Serial.print("locked? ");
+  // Serial.println(sampleLengthLocked);
+  // Serial.print("mappedStart: ");
+  // Serial.println(mappedStart);
+  // Serial.print("mappedEnd: ");
+  // Serial.println(mappedEnd);
+  // Serial.print("sliceStart: ");
+  // Serial.println(sliceStart);
+  // Serial.print("sliceEnd: ");
+  // Serial.println(sliceEnd);
 
   if (mappedStart > mappedEnd) {
     uint16_t swap = mappedStart;
@@ -1269,21 +1276,8 @@ void updateEditScreen() {
     mappedEnd = swap;
   }
 
-  // // 🎚️ Update cursor position if auditioning
-  // if (auditionMode && millis() - lastCursorUpdate > cursorInterval) {
-  //   cursorPixel++;
-  //   if (cursorPixel > map(endPos, 0, totalSamplesInView, 0, TOTAL_PIXELS)) {
-  //     cursorPixel = map(startPos, 0, totalSamplesInView, 0, TOTAL_PIXELS);  // loop
-  //   }
-  //   lastCursorUpdate = millis();
-  // }
-
-  // 🖼️ Draw UI
   lcd.clear();
   lcd.setCursor(0, 0);
-  // lcd.print("Len:");
-  // lcd.print(endPos - startPos);
-  // lcd.print(" ");
 
   if (editInnerState == SLICE) {
     lcd.print("SLICE");
@@ -1331,21 +1325,21 @@ void saveSliceFromEdit() {
 
 void enterEditStateForSample() {
   totalSamplesInView = samples[selectedSample].end - samples[selectedSample].start;
-  currentState = EDIT_STATE;
 
   sliceStart = samples[selectedSample].start;
   sliceEnd = samples[selectedSample].end;
   playback_pitch = samples[selectedSample].pitch;
 
-  Serial.print("selectedSample: ");
-  Serial.println(selectedSample);
-  Serial.print("totalSamplesInView: ");
-  Serial.println(totalSamplesInView);
-  Serial.print("start: ");
-  Serial.println(samples[selectedSample].start);
-  Serial.print("end: ");
-  Serial.println(samples[selectedSample].end);
+  // Serial.print("selectedSample: ");
+  // Serial.println(selectedSample);
+  // Serial.print("totalSamplesInView: ");
+  // Serial.println(totalSamplesInView);
+  // Serial.print("start: ");
+  // Serial.println(samples[selectedSample].start);
+  // Serial.print("end: ");
+  // Serial.println(samples[selectedSample].end);
 
+  currentState = EDIT_STATE;
   updateEditScreen();
 }
 
@@ -1359,19 +1353,6 @@ void (*nextFunc)();
 
 void loop() {
   now = millis();
-
-  if (displayingMessage) {
-    if (now - messageTime > 1000) {
-      displayingMessage = false;
-      nextFunc();
-    }
-  }
-
-  // if (now - last_millis > 100) {
-  //   last_millis = now;
-  //   flipper = !flipper;
-  //   digitalWrite(SYNC_PIN, flipper);
-  // }
 
   // Update all buttons
   recordButton.update();
@@ -1409,72 +1390,67 @@ void loop() {
       }
       break;
     
-    // case SELECT_MATCH_STATE:
-    //   {
-    //     if (upButton.pressed()) {
-    //       if (selectedMatchSample > 0) selectedMatchSample--;
+    case SELECT_MATCH_STATE:
+      {
+        if (upButton.pressed()) {
+          if (selectedMatchSample > 0) selectedMatchSample--;
 
-    //       Serial.println(selectedMatchSample);
-    //       Serial.println(sampleCount);
-    //       Serial.println("");
+          // Serial.println(selectedMatchSample);
+          // Serial.println(sampleCount);
+          // Serial.println("");
 
-    //       drawSelectMatchList();
-    //     }
+          drawSelectMatchList();
+        }
 
-    //     if (downButton.pressed()) {
-    //       if (selectedMatchSample < sampleCount) selectedMatchSample++;
+        if (downButton.pressed()) {
+          if (selectedMatchSample < sampleCount) selectedMatchSample++;
 
-    //       Serial.println(selectedMatchSample);
-    //       Serial.println(sampleCount);
-    //       Serial.println("");
+          // Serial.println(selectedMatchSample);
+          // Serial.println(sampleCount);
+          // Serial.println("");
 
-    //       drawSelectMatchList();
-    //     }
+          drawSelectMatchList();
+        }
 
-    //     if (selectButton.pressed()) {
-    //       if (selectedMatchSample > 1) {
-    //         Serial.println(selectedMatchSample);
+        if (selectButton.pressed()) {
+          if (selectedMatchSample > 1) {
+            // Serial.println(selectedMatchSample);
 
-    //         uint8_t matchSample = selectedMatchSample - 1;
-    //         uint32_t yourLen = samples[matchSample].end - samples[matchSample].start;
-    //         uint32_t myLen = samples[selectedSample].end - samples[selectedSample].start;
+            uint8_t matchSample = selectedMatchSample - 1;
+            uint32_t yourLen = samples[matchSample].end - samples[matchSample].start;
+            uint32_t myLen = samples[selectedSample].end - samples[selectedSample].start;
 
-    //         // yes I'm really a programmer
-    //         float pitchModifier = (float)64 / samples[matchSample].pitch;
-    //         float pitchModifiedSampleLength = yourLen * pitchModifier;
+            float pitchModifier = (float)64 / samples[matchSample].pitch;
+            float pitchModifiedSampleLength = yourLen * pitchModifier;
 
-    //         samples[selectedSample].matched_sample_id = matchSample;
-    //         float floatLen = (float)myLen / pitchModifiedSampleLength;
-    //         samples[selectedSample].matched_pitch = floatLen * 64;
+            samples[selectedSample].matched_sample_id = matchSample;
+            float floatLen = (float)myLen / pitchModifiedSampleLength;
+            samples[selectedSample].matched_pitch = floatLen * 64;
 
-    //         secondary_zero_beat_sample_id = selectedSample;
+            // Serial.println("selectedSample");
+            // Serial.println(selectedSample);
+            // Serial.println("matchSample");
+            // Serial.println(matchSample);
+            // Serial.println("selectedSample Len");
+            // Serial.println(myLen);
+            // Serial.println("matchSample Len");
+            // Serial.println(yourLen);
+            // Serial.println("matched_sample_id");
+            // Serial.println(samples[selectedSample].matched_sample_id);
+            // Serial.println("matched_pitch");
+            // Serial.println(samples[selectedSample].matched_pitch);
 
-    //         Serial.println("selectedSample");
-    //         Serial.println(selectedSample);
-    //         Serial.println("matchSample");
-    //         Serial.println(matchSample);
-    //         Serial.println("selectedSample Len");
-    //         Serial.println(myLen);
-    //         Serial.println("matchSample Len");
-    //         Serial.println(yourLen);
-    //         Serial.println("matched_sample_id");
-    //         Serial.println(samples[selectedSample].matched_sample_id);
-    //         Serial.println("matched_pitch");
-    //         Serial.println(samples[selectedSample].matched_pitch);
-    //         Serial.println("secondary_zero_beat_sample_id");
-    //         Serial.println(secondary_zero_beat_sample_id);
+            currentState = INDEX_STATE;
+            drawSampleList();
+          }
+        }
 
-    //         currentState = INDEX_STATE;
-    //         drawSampleList();
-    //       }
-    //     }
-
-    //     if (modeButton.pressed()) {
-    //       currentState = INDEX_STATE;
-    //       drawSampleList();
-    //     }
-    //   }
-    //   break;
+        if (modeButton.pressed()) {
+          currentState = INDEX_STATE;
+          drawSampleList();
+        }
+      }
+      break;
 
     case INDEX_STATE:
       {
@@ -1564,10 +1540,10 @@ void loop() {
           }
         }
 
-        if (upButton.pressed()) {
-          loopMode = !loopMode;  // Toggle loop mode
-          updateEditScreen();    // Update loop label
-        }
+        // if (upButton.pressed()) {
+        //   loopMode = !loopMode;  // Toggle loop mode
+        //   updateEditScreen();    // Update loop label
+        // }
 
         if (downButton.pressed()) {
           currentState = INDEX_STATE;
@@ -1781,7 +1757,7 @@ void loop() {
           current_step = 0;
           currentState = SAMPLER_STATE;
           cursorPos = edit_cursor_pos;
-          digitalWrite(LED_PIN, LOW);
+          fastDigitalWriteLow(LED_PIN);
           updateSequencerScreen();
         }
 
@@ -1849,7 +1825,7 @@ void loop() {
         if (selectButton.pressed()) {
           currentState = SONG_STATE;
           songCursorPos = edit_cursor_pos;
-          digitalWrite(LED_PIN, LOW);
+          fastDigitalWriteLow(LED_PIN);
 
           int sequence_id = sequence_chain[0];
           if (sequence_id != -1) {

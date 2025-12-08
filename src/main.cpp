@@ -632,40 +632,31 @@ uint16_t read_ram_sample(uint32_t global_address) {
   uint8_t chip = global_address / CHUNK_SIZE;
   uint32_t local_address = global_address % CHUNK_SIZE;
 
+  // Read first byte (COMPLETE transaction)
   select_chip(chip);
   SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE3));
-  SPI.transfer(3);  // Read command
+  SPI.transfer(3);
   SPI.transfer((local_address >> 16) & 0xFF);
   SPI.transfer((local_address >> 8) & 0xFF);
   SPI.transfer(local_address & 0xFF);
-  
-  // Read both bytes in the same transaction
   uint8_t upper = SPI.transfer(0);
-  
-  // Check if we cross chip boundary
-  uint8_t lower;
-  if (((global_address + 1) / CHUNK_SIZE) != chip) {
-    // Crossed chip boundary - need to switch chips
-    SPI.endTransaction();
-    deselect_all_chips();
-    
-    chip = (global_address + 1) / CHUNK_SIZE;
-    local_address = (global_address + 1) % CHUNK_SIZE;
-    
-    select_chip(chip);
-    SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE3));
-    SPI.transfer(3);
-    SPI.transfer((local_address >> 16) & 0xFF);
-    SPI.transfer((local_address >> 8) & 0xFF);
-    SPI.transfer(local_address & 0xFF);
-    lower = SPI.transfer(0);
-  } else {
-    // Same chip - just read next byte
-    lower = SPI.transfer(0);
-  }
-
   SPI.endTransaction();
-  deselect_all_chips();
+  deselect_all_chips();  // CS HIGH - complete transaction
+
+  // Read second byte (NEW transaction)
+  global_address++;
+  chip = global_address / CHUNK_SIZE;
+  local_address = global_address % CHUNK_SIZE;
+  
+  select_chip(chip);
+  SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE3));
+  SPI.transfer(3);
+  SPI.transfer((local_address >> 16) & 0xFF);
+  SPI.transfer((local_address >> 8) & 0xFF);
+  SPI.transfer(local_address & 0xFF);
+  uint8_t lower = SPI.transfer(0);
+  SPI.endTransaction();
+  deselect_all_chips();  // CS HIGH - complete transaction
 
   return ((uint16_t)upper << 8) | lower;
 }

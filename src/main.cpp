@@ -1185,11 +1185,11 @@ void drawSliceBar(uint32_t start, uint32_t end) {
 uint16_t lastPot1 = 0;
 uint16_t lastPot2 = 0;
 
-void updateEditScreen() {
+void updateEditScreen(bool forceUpdate = false) {
   uint16_t start = analogRead(A0);
   uint16_t end = analogRead(A1);
 
-  if (abs(lastPot1 - start) < 100 && abs(lastPot2 - end) < 100) {
+  if (abs(lastPot1 - start) < 80 && abs(lastPot2 - end) < 80 && !forceUpdate) {
     return;
   }
 
@@ -1273,17 +1273,30 @@ void updateEditScreen() {
   if (editInnerState == SLICE) {
     lcd.print("SLICE");
     if (sampleLengthLocked) {
-      if (sampleLengthDivision == 0) {
-        lcd.print("        1/1");
-      } else if (sampleLengthDivision == 1) {
-        lcd.print("        1/2");
+      if (loopMode) {
+        lcd.print("      L");
       } else {
-        lcd.print("        1/4");
+        lcd.print("       ");
+      }
+
+      if (sampleLengthDivision == 0) {
+        lcd.print(" 1/1");
+      } else if (sampleLengthDivision == 1) {
+        lcd.print(" 1/2");
+      } else {
+        lcd.print(" 1/4");
+      }
+    } else {
+      if (loopMode) {
+        lcd.print("      L    ");
+      } else {
+        lcd.print("           ");
       }
     }
     drawSliceBar(mappedStart, mappedEnd);
   } else {
     lcd.print("PITCH");
+    lcd.print("           ");
     drawPitchBar();
   }
 }
@@ -1341,6 +1354,8 @@ bool selectingSecondarySample = false;
 bool displayingMessage = false;
 int messageTime = 0;
 void (*nextFunc)();
+uint16_t potStart = 0;
+uint16_t potEnd = 0;
 
 void loop() {
   now = millis();
@@ -1531,14 +1546,9 @@ void loop() {
           }
         }
 
-        // if (upButton.pressed()) {
-        //   loopMode = !loopMode;  // Toggle loop mode
-        //   updateEditScreen();    // Update loop label
-        // }
-
         if (downButton.pressed()) {
-          currentState = INDEX_STATE;
-          drawSampleList();
+          loopMode = !loopMode;
+          updateEditScreen(true);
         }
 
         if (selectButton.pressed()) {
@@ -1579,6 +1589,24 @@ void loop() {
         if (modeButton.pressed()) {
           playback_accumulator = 0;
           playback_address = sliceStart;
+        }
+
+        if (selectButton.pressed()) {
+          // stop playback and return to previous state
+          playback_accumulator = 0;
+          playback_address = sliceStart;
+          // fastDigitalWriteLow(LED_PIN);
+
+          currentState = nextState;
+          if (currentState == EDIT_STATE) {
+            updateEditScreen();
+          } else if (currentState == SELECT_SAMPLE_STATE) {
+            drawSelectSampleList();
+          }
+        }
+
+        if (abs(lastPot1 - potStart) > 80 || abs(lastPot2 - potEnd) > 80) {
+          updateEditScreen(true);
         }
       }
       break;
@@ -1960,6 +1988,9 @@ void loop() {
         }
       }
       break;
+      
+      potStart = analogRead(A0);
+      potEnd = analogRead(A1);
   }
 
   updateCurrentStateIfNeeded();  // Leave as-is if useful

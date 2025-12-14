@@ -10,6 +10,7 @@
 // Forward declarations
 void write_dac_sample(uint16_t sample);
 uint16_t read_ram_sample(uint32_t global_address);
+void write_ram_sample(uint32_t global_address, uint16_t sample);
 void write_ram_sample_sequential(uint16_t sample);
 void deselect_all_chips();
 void set_ram_byte_mode();
@@ -18,6 +19,10 @@ void drawSampleList();
 void updateSequencerScreen();
 void updateSongScreen();
 void updateRecordingScreen();
+void drawPlaybackScreen();
+bool updateSliceAndPitchFromPots(bool forceUpdate = false);
+void drawEditScreen();
+void updateEditScreen(bool forceUpdate = false);
 
 #define R1 7
 #define R2 8
@@ -160,9 +165,11 @@ const int TOTAL_PIXELS = 16 * 5;
 const int BAR_CHARS = 16;
 
 bool loopMode = false;
-bool isPlayingSlice = false;
 uint32_t sliceStart = 0;
 uint32_t sliceEnd = 0;
+
+uint8_t playheadCharPos = 0;
+uint8_t lastPlayheadCharPos = 255;
 
 uint32_t savedSliceStart = 0;
 uint32_t savedSliceEnd = 0;
@@ -312,6 +319,7 @@ bool TimerHandler(struct repeating_timer *t) {
   if (currentState == RECORD_STATE) {
     if (global_position >= maxGlobalPosition) {
       currentState = DONE_PLAYING;
+      // finish the recording
       return true;
     }
 
@@ -341,17 +349,23 @@ bool TimerHandler(struct repeating_timer *t) {
     // Convert index to byte address (2 bytes per 12-bit sample)
     playback_address = sliceStart + sample_index * 2;
 
+    // Calculate playhead position for display
+    uint32_t sliceLength = sliceEnd - sliceStart;
+    uint32_t playbackOffset = playback_address - sliceStart;
+    playheadCharPos = map(playbackOffset, 0, sliceLength, 0, 15);
+    if (playheadCharPos > 15) playheadCharPos = 15;
+
     // Read and write sample
     write_dac_sample(read_ram_sample(playback_address));
 
     // Loop or exit
     if (playback_address >= sliceEnd) {
-      if (isPlayingSlice && loopMode) {
+      if (loopMode) {
         playback_accumulator = 0;  // Reset to start
       } else {
         currentState = nextState;
-        isPlayingSlice = false;
         playback_accumulator = 0;
+        needsUpdate = true;
       }
     }
   } else if (currentState == SAMPLER_PLAYBACK_STATE || currentState == SONG_PLAYBACK_STATE) {
@@ -624,6 +638,7 @@ void set_ram_mode(uint8_t mode) {
 void set_ram_byte_mode() {
   set_ram_mode(0);
 }
+
 void set_ram_sequential_mode() {
   set_ram_mode(64);
 }
@@ -659,6 +674,39 @@ uint16_t read_ram_sample(uint32_t global_address) {
   deselect_all_chips();  // CS HIGH - complete transaction
 
   return ((uint16_t)upper << 8) | lower;
+}
+
+// Byte mode write: writes a single 16-bit sample at the specified address
+// Requires two separate transactions (one per byte) to respect byte mode
+void write_ram_sample(uint32_t global_address, uint16_t sample) {
+  uint8_t chip = global_address / CHUNK_SIZE;
+  uint32_t local_address = global_address % CHUNK_SIZE;
+
+  // Write first byte (upper byte) - COMPLETE transaction
+  select_chip(chip);
+  SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE3));
+  SPI.transfer(2);  // WRITE opcode
+  SPI.transfer((local_address >> 16) & 0xFF);
+  SPI.transfer((local_address >> 8) & 0xFF);
+  SPI.transfer(local_address & 0xFF);
+  SPI.transfer((sample >> 8) & 0xFF);  // Upper byte
+  SPI.endTransaction();
+  deselect_all_chips();  // CS HIGH - complete transaction
+
+  // Write second byte (lower byte) - NEW transaction
+  global_address++;
+  chip = global_address / CHUNK_SIZE;
+  local_address = global_address % CHUNK_SIZE;
+  
+  select_chip(chip);
+  SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE3));
+  SPI.transfer(2);  // WRITE opcode
+  SPI.transfer((local_address >> 16) & 0xFF);
+  SPI.transfer((local_address >> 8) & 0xFF);
+  SPI.transfer(local_address & 0xFF);
+  SPI.transfer(sample & 0xFF);  // Lower byte
+  SPI.endTransaction();
+  deselect_all_chips();  // CS HIGH - complete transaction
 }
 
 // void begin_reading_ram_sequential(uint32_t global_address) {
@@ -790,6 +838,38 @@ void updateRecordingScreen() {
   lcd.print("Time: ");
   lcd.print(elapsed);
   lcd.print("s        ");  // Padding to clear leftovers
+}
+
+// Upward compression: brings quiet sounds up while leaving loud sounds unchanged
+// Uses square root curve for smooth, natural-sounding compression
+void compressSample(uint32_t start, uint32_t end) {
+  for (uint32_t addr = start; addr < end; addr += 2) {
+    uint16_t sample = read_ram_sample(addr);
+    
+    // Convert to signed 12-bit (-2048 to 2047)
+    int16_t signedSample = sample - 2048;
+    
+    // Normalize to -1.0 to 1.0
+    float normalized = signedSample / 2048.0f;
+    
+    // Apply compression curve using square root
+    // Quiet sounds get boosted more than loud sounds
+    float sign = (normalized >= 0.0f) ? 1.0f : -1.0f;
+    float absNormalized = (normalized >= 0.0f) ? normalized : -normalized;
+    
+    // Square root compression: 0.1 → 0.316 (3x), 0.5 → 0.707 (1.4x), 1.0 → 1.0 (1x)
+    float compressed = sign * sqrtf(absNormalized);
+    
+    // Convert back to signed 12-bit
+    signedSample = (int16_t)(compressed * 2047.0f);
+    
+    // Clamp to valid range (safety)
+    if (signedSample > 2047) signedSample = 2047;
+    if (signedSample < -2048) signedSample = -2048;
+    
+    // Convert back to unsigned and write
+    write_ram_sample(addr, (uint16_t)(signedSample + 2048));
+  }
 }
 
 void updateCurrentStateIfNeeded() {
@@ -1185,12 +1265,14 @@ void drawSliceBar(uint32_t start, uint32_t end) {
 uint16_t lastPot1 = 0;
 uint16_t lastPot2 = 0;
 
-void updateEditScreen(bool forceUpdate = false) {
+// Calculation-only function: reads pots and updates slice/pitch globals
+// Returns true if values changed significantly, false otherwise
+bool updateSliceAndPitchFromPots(bool forceUpdate) {
   uint16_t start = analogRead(A0);
   uint16_t end = analogRead(A1);
 
   if (abs(lastPot1 - start) < 80 && abs(lastPot2 - end) < 80 && !forceUpdate) {
-    return;
+    return false;
   }
 
   lastPot1 = start;
@@ -1207,26 +1289,7 @@ void updateEditScreen(bool forceUpdate = false) {
     } else if (sampleLengthDivision == 2) {
       adjustedLockedSampleLength = lockedSampleLength / 4;
     }
-    // speculative:
-    // in the slice screen we could show a number in the upper right:
-    // 1/1, 1/2, 1/4
-    // DEFAULT TO 1/1
-    // that determines what portion of the locked sample length we are using
-    // if 1/1 doesn't fit, default to 1/2
-    // if that doesn't fit, defualt to 1/4
-    // don't switch to ones that don't fit
-    // if none fit then...
-    // if (lockedSampleLength > totalSamplesInView) {
-    //   // make some auto adjustments to account for lack of room to fit sample
-    //   // OR DIE
-    // }
-      // do the code to do the thing vvv
-      
-      // if (mappedStart + (lockedSampleLength / 2) < totalSamplesInView) {
-      // } else {
-      //   // not sure what to do here, we are at an impasse
-      // }
-      // FOR NOW, let's just ignore this case and pretend like it didn't happen.
+
     if (mappedStart + adjustedLockedSampleLength < totalSamplesInView) {
       // "regular" scenario
       mappedEnd = mappedStart + adjustedLockedSampleLength;
@@ -1238,31 +1301,33 @@ void updateEditScreen(bool forceUpdate = false) {
   }
 
   if (editInnerState == SLICE) {
-    // sliceStart = map(start, 0, 4095, samples[selectedSample].start, samples[selectedSample].end);
     sliceStart = samples[selectedSample].start + mappedStart;
     if (sliceStart % 2 != 0) sliceStart++;
     sliceEnd = samples[selectedSample].start + mappedEnd;
-    // sliceEnd = map(end, 0, 4095, samples[selectedSample].start, samples[selectedSample].end);
     if (sliceEnd % 2 != 0) sliceEnd++;
   } else {
     playback_pitch = map(end, 0, 4095, 32, 127);
   }
 
-  // Serial.print("totalSamplesInView (the sample length): ");
-  // Serial.println(totalSamplesInView);
-  // Serial.print("locked? ");
-  // Serial.println(sampleLengthLocked);
-  // Serial.print("mappedStart: ");
-  // Serial.println(mappedStart);
-  // Serial.print("mappedEnd: ");
-  // Serial.println(mappedEnd);
-  // Serial.print("sliceStart: ");
-  // Serial.println(sliceStart);
-  // Serial.print("sliceEnd: ");
-  // Serial.println(sliceEnd);
+  return true;
+}
+
+// Display-only function: draws the edit screen based on current globals
+void drawEditScreen() {
+  // Recalculate mapped values from current sliceStart/sliceEnd
+  uint32_t mappedStart, mappedEnd;
+  
+  if (editInnerState == SLICE) {
+    mappedStart = sliceStart - samples[selectedSample].start;
+    mappedEnd = sliceEnd - samples[selectedSample].start;
+  } else {
+    // For pitch screen, recalculate from lastPot1 and lastPot2
+    mappedStart = map(lastPot1, 0, 4095, 0, totalSamplesInView);
+    mappedEnd = map(lastPot2, 0, 4095, 0, totalSamplesInView);
+  }
 
   if (mappedStart > mappedEnd) {
-    uint16_t swap = mappedStart;
+    uint32_t swap = mappedStart;
     mappedStart = mappedEnd;
     mappedEnd = swap;
   }
@@ -1298,6 +1363,56 @@ void updateEditScreen(bool forceUpdate = false) {
     lcd.print("PITCH");
     lcd.print("           ");
     drawPitchBar();
+  }
+}
+
+// Combined function for backwards compatibility: reads pots AND updates display
+void updateEditScreen(bool forceUpdate) {
+  if (updateSliceAndPitchFromPots(forceUpdate)) {
+    drawEditScreen();
+  }
+}
+
+void drawPlaybackScreen() {
+  lcd.setCursor(0, 0);
+  
+  // Top row - same as normal edit screen
+  if (editInnerState == SLICE) {
+    lcd.print("SLICE");
+    if (sampleLengthLocked) {
+      if (loopMode) {
+        lcd.print("      L");
+      } else {
+        lcd.print("       ");
+      }
+
+      if (sampleLengthDivision == 0) {
+        lcd.print(" 1/1");
+      } else if (sampleLengthDivision == 1) {
+        lcd.print(" 1/2");
+      } else {
+        lcd.print(" 1/4");
+      }
+    } else {
+      if (loopMode) {
+        lcd.print("      L    ");
+      } else {
+        lcd.print("           ");
+      }
+    }
+  } else {
+    lcd.print("PITCH");
+    lcd.print("           ");
+  }
+  
+  // Bottom row - playhead visualization
+  lcd.setCursor(0, 1);
+  for (int i = 0; i < 16; i++) {
+    if (i == playheadCharPos) {
+      lcd.write(255);  // Solid block at playhead
+    } else {
+      lcd.write('-');  // Dash for rest
+    }
   }
 }
 
@@ -1551,6 +1666,11 @@ void loop() {
           updateEditScreen(true);
         }
 
+        if (upButton.pressed()) {
+          playback_pitch = 64; // reset pitch to default
+          updateEditScreen(true);
+        }
+
         if (selectButton.pressed()) {
           if (modeButton.held()) {
             modeButtonUsedAsModifier = true;
@@ -1568,46 +1688,60 @@ void loop() {
 
             nextState = EDIT_STATE;
             currentState = PLAY_STATE;
-
-            isPlayingSlice = true;
           }
         }
 
         if (modeButton.released()) {
           if (!modeButtonUsedAsModifier) {
-            currentState = INDEX_STATE;
-            drawSampleList();
+            if (editInnerState == SLICE) {
+              currentState = INDEX_STATE;
+              drawSampleList();
+            } else {
+              editInnerState = SLICE;
+            }
           }
 
           modeButtonUsedAsModifier = false;
+        }
+
+        if (needsUpdate) {
+          Serial.println("forcing update after playback");
+          updateEditScreen(true);
+          needsUpdate = false;
         }
       }
       break;
 
     case PLAY_STATE:
       {
+        // Update playback visualization
+        if (playheadCharPos != lastPlayheadCharPos) {
+          drawPlaybackScreen();
+          lastPlayheadCharPos = playheadCharPos;
+        }
+
         if (modeButton.pressed()) {
           playback_accumulator = 0;
           playback_address = sliceStart;
+          lastPlayheadCharPos = 255;  // Force redraw on restart
         }
 
         if (selectButton.pressed()) {
-          // stop playback and return to previous state
+          // Stop playback and return to previous state
           playback_accumulator = 0;
           playback_address = sliceStart;
-          // fastDigitalWriteLow(LED_PIN);
 
           currentState = nextState;
           if (currentState == EDIT_STATE) {
-            updateEditScreen();
+            updateEditScreen(true);
           } else if (currentState == SELECT_SAMPLE_STATE) {
             drawSelectSampleList();
           }
         }
 
-        if (abs(lastPot1 - potStart) > 80 || abs(lastPot2 - potEnd) > 80) {
-          updateEditScreen(true);
-        }
+        // Allow pot adjustments during playback without updating display
+        updateSliceAndPitchFromPots(false);
+
       }
       break;
 
@@ -1704,7 +1838,6 @@ void loop() {
 
             nextState = SELECT_SAMPLE_STATE;
             currentState = PLAY_STATE;
-            isPlayingSlice = true;
           }
         }
 
@@ -1993,5 +2126,5 @@ void loop() {
       potEnd = analogRead(A1);
   }
 
-  updateCurrentStateIfNeeded();  // Leave as-is if useful
+  updateCurrentStateIfNeeded();
 }

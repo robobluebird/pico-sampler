@@ -308,11 +308,11 @@ typedef struct {
   char name[16];
 } Option;
 
-Option options[3] = { "SAMPLES", "SEQUENCE", "SONG" };
+Option options[4] = { "SAMPLES", "SEQUENCE", "SONG", "CLEAR DATA" };
 uint8_t selectedOption = 0;
 Sample samples[MAX_SAMPLES] = { 0 };
 uint8_t sampleCount = 0;
-uint8_t optionCount = 3;
+uint8_t optionCount = 4;
 
 State currentState = HOME_STATE;
 State nextState = INDEX_STATE;
@@ -805,7 +805,7 @@ uint8_t read_ram_byte(uint32_t global_address) {
   uint32_t local_address = global_address % CHUNK_SIZE;
   
   select_chip(chip);
-  SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE0));
+  SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE3));
   SPI.transfer(0x03);  // READ command
   SPI.transfer((local_address >> 16) & 0xFF);
   SPI.transfer((local_address >> 8) & 0xFF);
@@ -823,7 +823,7 @@ void write_ram_byte(uint32_t global_address, uint8_t value) {
   uint32_t local_address = global_address % CHUNK_SIZE;
   
   select_chip(chip);
-  SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE0));
+  SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE3));
   SPI.transfer(0x02);  // WRITE command
   SPI.transfer((local_address >> 16) & 0xFF);
   SPI.transfer((local_address >> 8) & 0xFF);
@@ -851,6 +851,9 @@ void read_ram_bytes(uint32_t addr, uint8_t* data, uint32_t len) {
 void saveMetadataToSRAM() {
   Serial.println("*** Saving metadata to persistent SRAM...");
   
+  // Disable timer interrupt to prevent SPI bus contention
+  ITimer.disableTimer();
+  
   uint32_t addr = METADATA_START;
   
   // Write header
@@ -862,6 +865,15 @@ void saveMetadataToSRAM() {
   header.reserved = 0;
   
   write_ram_bytes(addr, (uint8_t*)&header, sizeof(MetadataHeader));
+  
+  // Verify the write by reading back immediately
+  MetadataHeader verify;
+  read_ram_bytes(METADATA_START, (uint8_t*)&verify, sizeof(MetadataHeader));
+  Serial.print("  Wrote magic: 0x");
+  Serial.print(METADATA_MAGIC, HEX);
+  Serial.print(", read back: 0x");
+  Serial.println(verify.magic, HEX);
+  
   addr += sizeof(MetadataHeader);
   
   Serial.print("  Saving ");
@@ -898,11 +910,17 @@ void saveMetadataToSRAM() {
   }
   
   Serial.println("*** Metadata saved! (will persist with battery backup)");
+  
+  // Re-enable timer interrupt
+  ITimer.enableTimer();
 }
 
 // Load sample and sequence metadata from persistent SRAM
 bool loadMetadataFromSRAM() {
   Serial.println("*** Checking for persistent metadata...");
+  
+  // Disable timer interrupt to prevent SPI bus contention
+  ITimer.disableTimer();
   
   uint32_t addr = METADATA_START;
   
@@ -917,6 +935,7 @@ bool loadMetadataFromSRAM() {
     Serial.print(METADATA_MAGIC, HEX);
     Serial.print(", got: 0x");
     Serial.println(header.magic, HEX);
+    ITimer.enableTimer();
     return false;
   }
   
@@ -926,6 +945,7 @@ bool loadMetadataFromSRAM() {
     Serial.print(METADATA_VERSION);
     Serial.print(", got: ");
     Serial.println(header.version);
+    ITimer.enableTimer();
     return false;
   }
   
@@ -971,6 +991,9 @@ bool loadMetadataFromSRAM() {
   Serial.print(" samples and ");
   Serial.print(sequenceCount);
   Serial.println(" sequences from battery-backed SRAM!");
+  
+  // Re-enable timer interrupt
+  ITimer.enableTimer();
   
   return true;
 }
@@ -1028,6 +1051,16 @@ void loop1() {
 
 void setup() {
   Serial.begin(115200);
+  
+  // Initialize LCD first, before anything else
+  lcd.begin(16, 2);
+  lcd.clear();
+  lcd.print("Initializing...");
+  
+  // Wait for serial monitor to connect (give it 3 seconds)
+  // This allows us to see debug output from metadata loading
+  delay(3000);
+  Serial.println("\n\n=== Pico Sampler Starting ===");
 
   init_tanh_table();
 
@@ -1084,8 +1117,10 @@ void setup() {
     lcd.createChar(i, bars[i]);
   }
 
-  lcd.begin(16, 2);
+  lcd.clear();
   drawOptionList();
+  
+  Serial.println("Setup complete!");
 }
 
 void write_dac_sample(uint16_t sample) {
@@ -1958,6 +1993,11 @@ void enterSelectedOption() {
         updateSongScreen();
       }
       break;
+    case 3:
+      {
+        // CLEAR DATA - do nothing on select, wait for RECORD press
+      }
+      break;
   }
 }
 
@@ -2566,7 +2606,19 @@ void loop() {
     case HOME_STATE:
       {
         if (recordButton.pressed()) {
-          startRecording();
+          if (selectedOption == 3) {
+            // Clear all metadata
+            sampleCount = 0;
+            sequenceCount = 0;
+            global_position = 0;
+            initSequenceCache();
+            lcd.clear();
+            lcd.print("Data cleared!");
+            delay(1000);
+            drawOptionList();
+          } else {
+            startRecording();
+          }
         }
         if (upButton.pressed()) {
           if (selectedOption > 0) selectedOption--;
